@@ -1,0 +1,494 @@
+const TelegramBot = require('node-telegram-bot-api');
+const express =require('express');
+const cron = require('node-cron');
+const config = require('./config');
+const utils = require('./utils');
+const db = require('./db');
+const keyboards = require('./keyboards');
+const gemini = require('./gemini_service');
+
+// --- Инициализация ---
+const app = express();
+const port = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is running'));
+app.listen(port, () => console.log(`Server running on port ${port}`));
+
+const bot = new TelegramBot(config.token, { polling: true });
+console.log('Бот запущен...');
+
+let userState = {};
+function initializeUserState(chatId) {
+    if (!userState[chatId]) {
+        userState[chatId] = { action: null, data: {} };
+    }
+}
+
+// --- ФУНКЦИЯ ГЕНЕРАЦИИ ОТЧЕТА ---
+async function generateAndSendReport(chatId, startDate, endDate, messageId = null, isScheduled = false) {
+    const periodTitle = startDate === endDate ? `за ${startDate}` : `за период с ${startDate} по ${endDate}`;
+    const reportHeader = isScheduled ? `Автоматический отчет ${periodTitle}` : `Статистика ${periodTitle}`;
+
+    console.log(`[${chatId}] Запрос статистики ${periodTitle}`);
+    if (messageId) {
+        await bot.editMessageText(`⏳ Загружаю статистику ${periodTitle}...`, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(e => console.warn(e.message));
+    } else {
+        bot.sendChatAction(chatId, 'typing');
+    }
+
+    const stats = await db.getStatsForPeriod(chatId, startDate, endDate);
+    if (!stats) {
+        bot.sendMessage(chatId, `❌ Не удалось получить статистику ${periodTitle}.`, keyboards.mainKeyboard);
+        return;
+    }
+
+    let report = `📊 ${reportHeader}:\n\n`;
+    config.pieTypes.forEach(type => {
+        const pieStat = stats.pies[type] || { manufactured: 0, sold: 0, revenue: 0, price: stats.prices[type] || 0, written_off: 0, loss: 0 };
+        report += `"${type}" (цена: ${utils.formatNumber(pieStat.price)} ${config.currencySymbol}):\n`;
+        report += `- Изготовлено: ${utils.formatNumber(pieStat.manufactured)}\n`;
+        report += `- Продано: ${utils.formatNumber(pieStat.sold)} шт.\n`;
+        if (pieStat.written_off > 0) {
+            report += `- Списано: ${utils.formatNumber(pieStat.written_off)} шт. (потеря: ${utils.formatNumber(pieStat.loss)} ${config.currencySymbol})\n`;
+        }
+        report += `- Выручка (${type}): ${utils.formatNumber(pieStat.revenue)} ${config.currencySymbol}.\n\n`;
+    });
+    report += `Общая выручка: ${utils.formatNumber(stats.totalRevenue)} ${config.currencySymbol}.\n`;
+    if (stats.lossFromWriteOff > 0) {
+        report += `🗑️ Потери от списаний: ${utils.formatNumber(stats.lossFromWriteOff)} ${config.currencySymbol}.\n`;
+    }
+    report += `💸 Расходы за период: ${utils.formatNumber(stats.expenses)} ${config.currencySymbol}.\n`;
+    report += `📈 Чистая прибыль: ${utils.formatNumber(stats.profit)} ${config.currencySymbol}.\n`;
+
+    await bot.sendMessage(chatId, report, keyboards.mainKeyboard);
+}
+
+// --- Обработчики команд и сообщений ---
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!utils.checkAccess(chatId)) {
+        bot.sendMessage(chatId, '⛔ У вас нет доступа к этому боту.');
+        return;
+    }
+    initializeUserState(chatId);
+    bot.sendMessage(chatId, 'Привет! Я помогу тебе вести учет пирожков. Выбери действие:', keyboards.mainKeyboard);
+});
+
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    if (!utils.checkAccess(chatId) || !text || text.startsWith('/')) return;
+
+    initializeUserState(chatId);
+    const state = userState[chatId];
+    console.log(`[${chatId}] Текст: "${text}" | Состояние: ${state?.action || 'нет'}`);
+
+    // 1. Обработка состояний ввода
+    if (state && state.action) {
+        switch (state.action) {
+            case 'awaiting_pie_quantity': {
+                const quantity = parseInt(text, 10);
+                if (isNaN(quantity) || quantity <= 0) {
+                    bot.sendMessage(chatId, '❌ Введите корректное число (больше нуля).');
+                    return;
+                }
+                const pieType = state.data.type;
+                const result = await db.addManufacturedEntry(chatId, pieType, quantity);
+
+                if (result) {
+                    let message = `✅ Добавлено: ${utils.formatNumber(quantity)} "${pieType}".\nВсего сегодня: ${utils.formatNumber(result.new_total)}.`;
+                    
+                    if (result.remaining_reset) {
+                        message += `\n\n⚠️ *Внимание!* Вы добавили новую партию, поэтому старый остаток был сброшен для точности расчетов. Введите итоговый остаток в конце дня.`;
+                    }
+                    bot.sendMessage(chatId, message, {
+                        ...keyboards.mainKeyboard,
+                        parse_mode: 'Markdown'
+                    });
+                } else {
+                    bot.sendMessage(chatId, `❌ Ошибка сохранения.`, keyboards.mainKeyboard);
+                }
+                userState[chatId] = { action: null, data: {} };
+                return;
+            }
+            case 'awaiting_remaining_input': {
+                const quantity = parseInt(text, 10);
+                const { pieType, manufactured } = state.data;
+                if (isNaN(quantity) || quantity < 0) { bot.sendMessage(chatId, `❌ Введите корректное число (0 или больше).`); return; }
+                if (quantity > manufactured) { bot.sendMessage(chatId, `❌ Остаток (${quantity}) не может быть больше изготовленного (${manufactured}).`); return; }
+                const success = await db.saveRemainingToDb(chatId, pieType, quantity);
+                if (success) {
+                    bot.sendMessage(chatId, `👍 Записан остаток для "${pieType}": ${utils.formatNumber(quantity)}.`);
+                    userState[chatId] = { action: null, data: {} };
+                    await bot.sendMessage(chatId, 'Выбери следующий пирожок или вернись назад:', await keyboards.createRemainingKeyboard(chatId));
+                } else {
+                    bot.sendMessage(chatId, `❌ Ошибка сохранения остатка.`, keyboards.mainKeyboard);
+                    userState[chatId] = { action: null, data: {} };
+                }
+                return;
+            }
+            case 'awaiting_write_off_quantity': {
+                const quantity = parseInt(text, 10);
+                const { pieType, remaining } = state.data;
+                if (isNaN(quantity) || quantity <= 0) {
+                    bot.sendMessage(chatId, '❌ Введите корректное число (больше нуля).'); return;
+                }
+                if (quantity > remaining) {
+                    bot.sendMessage(chatId, `❌ Количество для списания (${quantity}) не может быть больше остатка (${remaining}). Попробуйте еще раз.`); return;
+                }
+                const result = await db.processWriteOffInDb(chatId, pieType, quantity);
+                if (result.success) {
+                    bot.sendMessage(chatId, `✅ Успешно списано ${quantity} шт. "${pieType}".`);
+                    userState[chatId] = { action: null, data: {} };
+                    await bot.sendMessage(chatId, 'Выберите следующую продукцию для списания:', await keyboards.createWriteOffKeyboard(chatId));
+                } else {
+                    bot.sendMessage(chatId, `❌ Ошибка при списании: ${result.message}`, keyboards.mainKeyboard);
+                    userState[chatId] = { action: null, data: {} };
+                }
+                return;
+            }
+            // --- ИЗМЕНЕНО ---
+            case 'awaiting_expenses_input': {
+                const amount = parseFloat(text.replace(',', '.'));
+                if (isNaN(amount) || amount <= 0) { bot.sendMessage(chatId, '❌ Введите корректную сумму (больше нуля).'); return; }
+                const newTotal = await db.addExpenseEntry(chatId, amount); // Используем новую функцию
+                bot.sendMessage(chatId, newTotal !== null ? `✅ Расход (${utils.formatNumber(amount)}) добавлен. Общие за сегодня: ${utils.formatNumber(newTotal)} ${config.currencySymbol}.` : `❌ Ошибка сохранения.`, keyboards.mainKeyboard);
+                userState[chatId] = { action: null, data: {} };
+                return;
+            }
+            case 'awaiting_price_input': {
+                const price = parseFloat(text.replace(',', '.'));
+                const { type } = state.data;
+                if (isNaN(price) || price < 0) { bot.sendMessage(chatId, '❌ Введите корректную цену.'); return; }
+                const success = await db.savePriceToDb(chatId, type, price);
+                bot.sendMessage(chatId, success ? `✅ Цена для "${type}" установлена: ${utils.formatNumber(price)} ${config.currencySymbol}.` : `❌ Ошибка сохранения.`);
+                userState[chatId] = { action: null, data: {} };
+                await bot.sendMessage(chatId, 'Текущие настройки цен:', await keyboards.createSettingsKeyboard(chatId));
+                return;
+            }
+            case 'awaiting_custom_start_date': {
+                if (!utils.isValidDate(text)) { bot.sendMessage(chatId, '❌ Неверный формат. Введите ГГГГ-ММ-ДД:'); return; }
+                userState[chatId] = { action: 'awaiting_custom_end_date', data: { startDate: text } };
+                bot.sendMessage(chatId, '✅ Отлично. Теперь введите дату конца (ГГГГ-ММ-ДД):');
+                return;
+            }
+            case 'awaiting_custom_end_date': {
+                if (!utils.isValidDate(text)) { bot.sendMessage(chatId, '❌ Неверный формат. Введите ГГГГ-ММ-ДД:'); return; }
+                const { startDate } = state.data;
+                if (new Date(text) < new Date(startDate)) { bot.sendMessage(chatId, '❌ Дата конца не может быть раньше даты начала.'); return; }
+                userState[chatId] = { action: null, data: {} };
+                await generateAndSendReport(chatId, startDate, text);
+                return;
+            }
+        }
+    }
+
+    // 2. Обработка кнопок главного меню
+    switch (text) {
+        case '➕ Добавить изготовленные пирожки':
+            bot.sendMessage(chatId, 'Какой тип пирожков изготовили?', keyboards.pieTypesKeyboard);
+            break;
+        case '📦 Ввести остатки':
+            bot.sendMessage(chatId, 'Для какого пирожка ввести/изменить остаток?', await keyboards.createRemainingKeyboard(chatId));
+            break;
+        case '🗑️ Списать продукцию':
+            bot.sendMessage(chatId, 'Выберите продукцию для списания (с остатком > 0):', await keyboards.createWriteOffKeyboard(chatId));
+            break;
+        // --- ИЗМЕНЕНО ---
+        case '💰 Ввести расходы':
+            // Теперь эта кнопка открывает новое меню
+            bot.sendMessage(chatId, '💰 Меню расходов', keyboards.expensesMenuKeyboard);
+            break;
+        case '📊 Посмотреть статистику':
+            bot.sendMessage(chatId, 'Выберите период для статистики или откройте аналитику:', keyboards.statsPeriodKeyboard);
+            break;
+        case '🛠 Настройки':
+            bot.sendMessage(chatId, '⚙️ Настройки цен на пирожки:', await keyboards.createSettingsKeyboard(chatId));
+            break;
+        default:
+            console.log(`[${chatId}] Неизвестный текст/команда: "${text}"`);
+            break;
+    }
+});
+
+// Обработка инлайн-кнопок
+bot.on('callback_query', async (callbackQuery) => {
+    const msg = callbackQuery.message;
+    const chatId = msg.chat.id;
+    const data = callbackQuery.data;
+
+    if (!utils.checkAccess(chatId)) {
+        bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ У вас нет доступа.', show_alert: true });
+        return;
+    }
+
+    initializeUserState(chatId);
+    console.log(`[${chatId}] Callback: ${data}`);
+    
+    const hideKeyboard = async () => {
+        try { await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msg.message_id }); }
+        catch (e) { await bot.deleteMessage(chatId, msg.message_id).catch(err => console.warn(err.message)); }
+    };
+
+    // --- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ РАСХОДОВ ---
+    if (data === 'add_expense') {
+        userState[chatId] = { action: 'awaiting_expenses_input', data: {} };
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Введите сумму расхода в ${config.currencySymbol}:`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data === 'correct_expense' || data === 'back_to_expenses_menu') {
+        const { keyboard, hasEntries } = await keyboards.createExpenseCorrectionKeyboard(chatId);
+        let text = '📝 *Исправление расходов*\n\n';
+        text += hasEntries ? 'Нажмите "Удалить ❌" для отмены записи.' : 'Сегодня не было записей о расходах.';
+        await bot.editMessageText(text, { chat_id: chatId, message_id: msg.message_id, reply_markup: keyboard.reply_markup, parse_mode: 'Markdown' });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data.startsWith('delete_expense_')) {
+        const entryId = parseInt(data.substring('delete_expense_'.length), 10);
+        const newTotal = await db.deleteExpenseEntry(chatId, entryId);
+    
+        if (newTotal !== null) {
+            await bot.answerCallbackQuery(callbackQuery.id, { text: '✅ Запись удалена!' });
+    
+            // Возвращаемся в главное меню расходов
+            await bot.editMessageText(
+                `💰 Меню расходов.\n✅ Запись успешно удалена. Общая сумма за сегодня: ${utils.formatNumber(newTotal)} ${config.currencySymbol}.`, 
+                {
+                    chat_id: chatId,
+                    message_id: msg.message_id,
+                    reply_markup: keyboards.expensesMenuKeyboard.reply_markup
+                }
+            );
+        } else {
+            await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Ошибка при удалении.', show_alert: true });
+        }
+        return;
+    }
+    if (data.startsWith('info_expense_')) {
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data === 'back_to_main_from_expenses') {
+        await bot.deleteMessage(chatId, msg.message_id).catch(e => console.warn(e.message));
+        bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+
+
+    // --- Обработчики для пирожков ---
+    if (data === 'show_correction_menu') {
+        await bot.editMessageText('📝 *Меню исправления*\n\nВыберите тип продукции, для которого нужно удалить ошибочную запись.', {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            reply_markup: keyboards.pieTypesForCorrectionKeyboard.reply_markup,
+            parse_mode: 'Markdown'
+        });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data === 'back_to_add_menu') {
+        await bot.editMessageText('Какой тип пирожков изготовили?', {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            reply_markup: keyboards.pieTypesKeyboard.reply_markup
+        });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data.startsWith('correct_pie_')) {
+        const pieType = data.substring('correct_pie_'.length);
+        const { keyboard, hasEntries } = await keyboards.createCorrectionKeyboard(chatId, pieType);
+        let messageText = `📝 Записи для "${pieType}" за сегодня.\n`;
+        if (hasEntries) {
+            messageText += `Нажмите "Удалить ❌", чтобы отменить ввод.`;
+        } else {
+            messageText += `Нет записей для удаления.`;
+        }
+        await bot.editMessageText(messageText, {
+            chat_id: chatId,
+            message_id: msg.message_id,
+            reply_markup: keyboard.reply_markup
+        });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data.startsWith('delete_entry_')) {
+        const entryId = parseInt(data.substring('delete_entry_'.length), 10);
+        const result = await db.deleteManufacturedEntry(chatId, entryId);
+    
+        if (result) {
+            await bot.answerCallbackQuery(callbackQuery.id, { text: '✅ Запись удалена!' });
+    
+            // Возвращаемся в главное меню добавления пирожков
+            await bot.editMessageText(
+                'Какой тип пирожков изготовили?\n\n✅ Запись успешно удалена.', 
+                {
+                    chat_id: chatId,
+                    message_id: msg.message_id,
+                    reply_markup: keyboards.pieTypesKeyboard.reply_markup
+                }
+            );
+        } else {
+            await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Ошибка при удалении.', show_alert: true });
+        }
+        return;
+    }
+    if (data.startsWith('info_entry_') || data === 'no_op') {
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    
+    // --- Остальные обработчики ---
+    if (data.startsWith('write_off_')) {
+        const pieType = data.substring('write_off_'.length);
+        const logEntry = await db.getDailyLogEntry(chatId, pieType);
+        const remainingCount = logEntry.remaining || 0;
+        if (remainingCount <= 0) {
+            bot.answerCallbackQuery(callbackQuery.id, { text: `У "${pieType}" нет остатка для списания.`, show_alert: true });
+            await bot.editMessageReplyMarkup((await keyboards.createWriteOffKeyboard(chatId)).reply_markup, { chat_id: chatId, message_id: msg.message_id });
+            return;
+        }
+        userState[chatId] = { action: 'awaiting_write_off_quantity', data: { pieType, remaining: remainingCount } };
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Сколько списать пирожков "${pieType}"? (В остатке: ${remainingCount}) Введите число:`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data.startsWith('analytics_')) {
+        const analyticsType = data.substring('analytics_'.length);
+        const loadingText = '⏳ Анализирую данные...';
+        await bot.editMessageText(loadingText, { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } }).catch(e => console.warn(e.message));
+        const endDate = new Date();
+        const startDate = new Date();
+        startDate.setDate(endDate.getDate() - 29);
+        const periodText = `за период с ${startDate.toISOString().split('T')[0]} по ${endDate.toISOString().split('T')[0]}`;
+        let report = '';
+        let parseMode = 'Markdown';
+        switch(analyticsType) {
+            case 'most_profitable': {
+                const results = await db.getProfitabilityAnalysis(chatId, startDate, endDate);
+                report = `🏆 Рейтинг по выручке ${periodText}:\n\n`;
+                if (!results || results.length === 0) { report += 'Нет данных для анализа.'; }
+                else { results.forEach((item, index) => { report += `${index + 1}. "${item.pie_type}": ${utils.formatNumber(item.total_revenue)} ${config.currencySymbol}\n`; }); }
+                break;
+            }
+            case 'most_sold': {
+                const results = await db.getSalesAnalysis(chatId, startDate, endDate);
+                report = `📈 Рейтинг по количеству продаж ${periodText}:\n\n`;
+                 if (!results || results.length === 0) { report += 'Нет данных для анализа.'; }
+                 else { results.forEach((item, index) => { report += `${index + 1}. "${item.pie_type}": продано ${utils.formatNumber(item.total_sold_quantity)} шт.\n`; }); }
+                break;
+            }
+            case 'weekday': {
+                const results = await db.getAverageWeekdayAnalysis(chatId, startDate, endDate);
+                report = `📅 Средние продажи по дням недели ${periodText}:\n\n`;
+                if (!results || results.length === 0) { report += 'Нет данных для анализа. Убедитесь, что вы вводили остатки за прошедшие дни.'; }
+                else {
+                    const dayMap = { 1: 'Понедельник', 2: 'Вторник', 3: 'Среда', 4: 'Четверг', 5: 'Пятница', 6: 'Суббота', 7: 'Воскресенье' };
+                    const groupedByDay = results.reduce((acc, item) => {
+                        const day = item.day_of_week_iso;
+                        if (!acc[day]) { acc[day] = []; }
+                        acc[day].push(`- ${item.pie_type}: ${item.avg_sold_quantity} шт.`);
+                        return acc;
+                    }, {});
+                    for (const day_iso in dayMap) {
+                         if (groupedByDay[day_iso]) {
+                            report += `*${dayMap[day_iso]}:*\n`;
+                            report += groupedByDay[day_iso].join('\n');
+                            report += '\n\n';
+                        }
+                    }
+                }
+                break;
+            }
+            case 'ai_forecast': {
+                await bot.editMessageText('🤖 Искусственный интеллект анализирует данные... Это может занять до 30 секунд.', { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
+                const salesData = await db.getSalesDataForAI(chatId);
+                if (!salesData) { report = '❌ Не удалось получить данные для анализа. Попробуйте позже.'; }
+                else { report = await gemini.getProductionForecast(salesData); }
+                parseMode = undefined;
+                break;
+            }
+        }
+        await bot.editMessageText(report, { chat_id: chatId, message_id: msg.message_id, parse_mode: parseMode, reply_markup: keyboards.analyticsTypeKeyboard.reply_markup });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data === 'show_analytics_menu') {
+        await bot.editMessageText('🧠 Аналитика\n\nВыберите тип отчета. Расчет будет произведен за последние 30 дней.', { chat_id: chatId, message_id: msg.message_id, reply_markup: keyboards.analyticsTypeKeyboard.reply_markup });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data === 'back_to_stats_menu') {
+        await bot.editMessageText('Выберите период для статистики или откройте аналитику:', { chat_id: chatId, message_id: msg.message_id, reply_markup: keyboards.statsPeriodKeyboard.reply_markup });
+        return bot.answerCallbackQuery(callbackQuery.id);
+    }
+    if (data.startsWith('stats_period_')) {
+        const periodType = data.substring('stats_period_'.length);
+        if (periodType === 'custom') {
+            userState[chatId] = { action: 'awaiting_custom_start_date', data: {} };
+            await hideKeyboard();
+            bot.sendMessage(chatId, '✍️ Введите дату начала периода (ГГГГ-ММ-ДД):');
+        } else {
+            let startDate, endDate = utils.getCurrentDate();
+            if (periodType === 'today') startDate = endDate;
+            else if (periodType === 'week') { const d = new Date(); d.setDate(d.getDate() - 6); startDate = d.toISOString().split('T')[0]; }
+            else if (periodType === 'month') { const d = new Date(); startDate = new Date(d.getFullYear(), d.getMonth(), 1).toISOString().split('T')[0]; }
+            else { return bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестный период' }); }
+            await generateAndSendReport(chatId, startDate, endDate, msg.message_id);
+        }
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else if (data.startsWith('add_pie_')) {
+        const pieType = data.substring('add_pie_'.length);
+        userState[chatId] = { action: 'awaiting_pie_quantity', data: { type: pieType } };
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Сколько пирожков "${pieType}" изготовили?`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else if (data.startsWith('enter_remaining_')) {
+        const pieType = data.substring('enter_remaining_'.length);
+        const logEntry = await db.getDailyLogEntry(chatId, pieType);
+        const manufacturedCount = logEntry.manufactured || 0;
+        if (manufacturedCount <= 0) {
+            bot.answerCallbackQuery(callbackQuery.id, { text: `"${pieType}" сегодня не изготовлены.` });
+            await bot.editMessageReplyMarkup((await keyboards.createRemainingKeyboard(chatId)).reply_markup, { chat_id: chatId, message_id: msg.message_id });
+            return;
+        }
+        userState[chatId] = { action: 'awaiting_remaining_input', data: { pieType, manufactured: manufacturedCount } };
+        const prevRem = (logEntry.remaining !== null) ? ` (ранее: ${logEntry.remaining})` : '';
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Сколько осталось "${pieType}"? (Изготовлено: ${manufacturedCount}${prevRem})`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else if (data.startsWith('set_price_')) {
+        const pieType = data.substring('set_price_'.length);
+        userState[chatId] = { action: 'awaiting_price_input', data: { type: pieType } };
+        await hideKeyboard();
+        bot.sendMessage(chatId, `Введите новую цену для "${pieType}" в ${config.currencySymbol}:`);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else if (data.startsWith('back_to_main_') || data.startsWith('no_pies_for_')) {
+        await bot.deleteMessage(chatId, msg.message_id).catch(e => console.warn(e.message));
+        bot.sendMessage(chatId, 'Выбери действие:', keyboards.mainKeyboard);
+        return bot.answerCallbackQuery(callbackQuery.id);
+    } else {
+        console.warn(`[${chatId}] Неизвестный callback: ${data}`);
+        return bot.answerCallbackQuery(callbackQuery.id, { text: 'Неизвестное действие' });
+    }
+});
+
+// --- ПЛАНИРОВЩИК И ОБРАБОТКА ОШИБОК ---
+if (cron.validate(config.REPORT_SCHEDULE)) {
+    cron.schedule(config.REPORT_SCHEDULE, async () => {
+        console.log(`[CRON] Запуск ежедневного отчета...`);
+        const today = utils.getCurrentDate();
+        const chatIds = config.ALLOWED_CHAT_IDS.split(',').map(id => id.trim());
+        for (const chatId of chatIds) {
+            try {
+                console.log(`[CRON] Отправка отчета пользователю ${chatId}`);
+                await generateAndSendReport(chatId, today, today, null, true);
+                await new Promise(resolve => setTimeout(resolve, 500));
+            } catch (error) {
+                console.error(`[CRON] Не удалось отправить отчет ${chatId}:`, error.message);
+            }
+        }
+        console.log(`[CRON] Отправка завершена.`);
+    }, { scheduled: true, timezone: config.REPORT_TIMEZONE });
+    console.log(`Авто-отчет запланирован на ${config.REPORT_SCHEDULE} (Timezone: ${config.REPORT_TIMEZONE})`);
+} else {
+    console.error(`!!! ОШИБКА: Неверный формат cron-строки: "${config.REPORT_SCHEDULE}"`);
+}
+
+bot.on('polling_error', (e) => console.error(`[Polling Error] ${e.message}`));
+process.on('uncaughtException', (e, o) => console.error(`Неперехваченное исключение: ${e}`, o));
+process.on('unhandledRejection', (r, p) => console.error('Необработанный reject:', p, `Причина: ${r}`));

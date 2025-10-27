@@ -1,0 +1,211 @@
+const { supabase, pieTypes } = require('./config');
+const { getCurrentDate } = require('./utils');
+
+// --- Функции получения/сохранения цен ---
+async function getPricesFromDb(chatId) {
+    const { data, error } = await supabase.from('chat_settings').select('pie_type, price').eq('chat_id', chatId);
+    if (error) {
+        console.error(`[${chatId}] Ошибка получения цен:`, error.message);
+        return pieTypes.reduce((acc, type) => { acc[type] = 0; return acc; }, {});
+    }
+    const prices = (data || []).reduce((acc, item) => { acc[item.pie_type] = parseFloat(item.price || 0); return acc; }, {});
+    pieTypes.forEach(type => { if (!(type in prices)) { prices[type] = 0; } });
+    return prices;
+}
+async function savePriceToDb(chatId, pieType, price) {
+    const { error } = await supabase.from('chat_settings').upsert({ chat_id: chatId, pie_type: pieType, price: price }, { onConflict: 'chat_id, pie_type' });
+    if (error) console.error(`[${chatId}] Ошибка сохранения цены:`, error.message);
+    return !error;
+}
+
+// --- Функции для записей об изготовлении ---
+async function addManufacturedEntry(chatId, pieType, quantity) {
+    const { data, error } = await supabase.rpc('add_manufactured_entry', {
+        p_chat_id: chatId,
+        p_pie_type: pieType,
+        p_quantity: quantity
+    });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC add_manufactured_entry:`, error.message);
+        return null;
+    }
+    return data[0] || { new_total: 0, remaining_reset: false };
+}
+async function getTodaysManufacturedEntries(chatId, pieType) {
+    const { data, error } = await supabase
+        .from('manufactured_log_entries')
+        .select('id, quantity, created_at')
+        .eq('chat_id', chatId)
+        .eq('log_date', getCurrentDate())
+        .eq('pie_type', pieType)
+        .order('created_at', { ascending: false });
+    if (error) {
+        console.error(`[${chatId}] Ошибка получения manufactured_log_entries:`, error.message);
+        return [];
+    }
+    return data;
+}
+async function deleteManufacturedEntry(chatId, entryId) {
+    const { data, error } = await supabase.rpc('delete_manufactured_entry', {
+        p_chat_id: chatId,
+        p_entry_id: entryId
+    });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC delete_manufactured_entry:`, error.message);
+        return null;
+    }
+    return data[0] || { new_total: 0, remaining_reset: false };
+}
+
+// --- НОВЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С РАСХОДАМИ ---
+async function addExpenseEntry(chatId, amount) {
+    const { data, error } = await supabase.rpc('add_expense_entry', { p_chat_id: chatId, p_amount: amount });
+    if (error) { console.error(`[${chatId}] Ошибка RPC add_expense_entry:`, error.message); return null; }
+    return data;
+}
+async function getTodaysExpenseEntries(chatId) {
+    const { data, error } = await supabase.from('expense_log_entries').select('id, amount, created_at').eq('chat_id', chatId).eq('log_date', getCurrentDate()).order('created_at', { ascending: false });
+    if (error) { console.error(`[${chatId}] Ошибка получения expense_log_entries:`, error.message); return []; }
+    return data;
+}
+async function deleteExpenseEntry(chatId, entryId) {
+    const { data, error } = await supabase.rpc('delete_expense_entry', { p_chat_id: chatId, p_entry_id: entryId });
+    if (error) { console.error(`[${chatId}] Ошибка RPC delete_expense_entry:`, error.message); return null; }
+    return data;
+}
+
+
+// --- Остальные функции ---
+async function getDailyLogEntry(chatId, pieType) {
+    const { data, error } = await supabase.from('daily_log').select('manufactured, remaining, written_off').eq('chat_id', chatId).eq('log_date', getCurrentDate()).eq('pie_type', pieType).maybeSingle();
+    if (error) {
+        console.error(`[${chatId}] Ошибка получения daily_log:`, error.message);
+        return { manufactured: 0, remaining: null, written_off: 0 };
+    }
+    return data || { manufactured: 0, remaining: null, written_off: 0 };
+}
+async function getTodaysLogsGrouped(chatId) {
+    const { data, error } = await supabase.from('daily_log').select('pie_type, manufactured, remaining, written_off').eq('chat_id', chatId).eq('log_date', getCurrentDate());
+    if (error) {
+        console.error(`[${chatId}] Ошибка получения логов за сегодня:`, error.message);
+        return {};
+    }
+    return (data || []).reduce((acc, log) => {
+        acc[log.pie_type] = {
+            manufactured: log.manufactured || 0,
+            remaining: log.remaining,
+            written_off: log.written_off || 0
+        };
+        return acc;
+    }, {});
+}
+async function saveRemainingToDb(chatId, pieType, remainingQuantity) {
+    const { data, error } = await supabase.rpc('upsert_daily_remaining', { p_chat_id: chatId, p_pie_type: pieType, p_remaining_quantity: remainingQuantity });
+    if (error || data === null) {
+        console.error(`[${chatId}] Ошибка RPC upsert_daily_remaining:`, error ? error.message : 'Запись не найдена');
+        return false;
+    }
+    return true;
+}
+async function processWriteOffInDb(chatId, pieType, quantity) {
+    const { data, error } = await supabase.rpc('process_write_off', {
+        p_chat_id: chatId,
+        p_pie_type: pieType,
+        p_quantity_to_write_off: quantity
+    });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC process_write_off:`, error.message);
+        const userFriendlyMessage = error.message.includes('не может быть больше остатка') ?
+            'Количество для списания превышает остаток.' :
+            'Произошла ошибка в базе данных.';
+        return { success: false, message: userFriendlyMessage };
+    }
+    console.log(`[${chatId}] RPC process_write_off успешно. Новое списано: ${data}`);
+    return { success: true, newTotal: data };
+}
+async function getStatsForPeriod(chatId, startDate, endDate) {
+    const prices = await getPricesFromDb(chatId);
+    const { data: aggregatedData, error } = await supabase.rpc('get_aggregated_stats', { p_chat_id: chatId, p_start_date: startDate, p_end_date: endDate });
+    if (error) {
+        console.error(`[${chatId}] Ошибка RPC get_aggregated_stats:`, error.message);
+        return null;
+    }
+    const periodTotals = (aggregatedData.logs || []).reduce((acc, log) => {
+        acc[log.pie_type] = {
+            manufactured: log.total_manufactured || 0,
+            sold: log.total_sold || 0,
+            written_off: log.total_written_off || 0
+        };
+        return acc;
+    }, {});
+    const stats = {
+        pies: {}, prices: prices, totalRevenue: 0,
+        expenses: aggregatedData.expenses || 0,
+        totalWrittenOff: 0,
+        lossFromWriteOff: 0,
+        profit: 0,
+        period: { start: startDate, end: endDate }
+    };
+    for (const type of pieTypes) {
+        const totals = periodTotals[type] || { manufactured: 0, sold: 0, written_off: 0 };
+        const price = prices[type] || 0;
+        const totalManufactured = totals.manufactured;
+        const totalSold = totals.sold;
+        const totalWrittenOffForType = totals.written_off;
+        const revenueForType = totalSold > 0 ? totalSold * price : 0;
+        const lossForType = totalWrittenOffForType > 0 ? totalWrittenOffForType * price : 0;
+        stats.pies[type] = {
+            manufactured: totalManufactured, sold: totalSold,
+            written_off: totalWrittenOffForType, revenue: revenueForType,
+            price: price, loss: lossForType
+        };
+        stats.totalRevenue += revenueForType;
+        stats.totalWrittenOff += totalWrittenOffForType;
+        stats.lossFromWriteOff += lossForType;
+    }
+    stats.profit = stats.totalRevenue - stats.expenses - stats.lossFromWriteOff;
+    return stats;
+}
+async function getProfitabilityAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_profitability_ranking', { p_chat_id: chatId, p_start_date: startDate.toISOString().split('T')[0], p_end_date: endDate.toISOString().split('T')[0] });
+    if (error) { console.error(`[${chatId}] Ошибка RPC get_profitability_ranking:`, error.message); return null; }
+    return data;
+}
+async function getSalesAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_sales_ranking', { p_chat_id: chatId, p_start_date: startDate.toISOString().split('T')[0], p_end_date: endDate.toISOString().split('T')[0] });
+    if (error) { console.error(`[${chatId}] Ошибка RPC get_sales_ranking:`, error.message); return null; }
+    return data;
+}
+async function getAverageWeekdayAnalysis(chatId, startDate, endDate) {
+    const { data, error } = await supabase.rpc('get_average_weekday_sales', { p_chat_id: chatId, p_start_date: startDate.toISOString().split('T')[0], p_end_date: endDate.toISOString().split('T')[0] });
+    if (error) { console.error(`[${chatId}] Ошибка RPC get_average_weekday_sales:`, error.message); return null; }
+    return data;
+}
+async function getSalesDataForAI(chatId) {
+    const { data, error } = await supabase.rpc('get_sales_data_for_ai', { p_chat_id: chatId });
+    if (error) { console.error(`[${chatId}] Ошибка RPC get_sales_data_for_ai:`, error.message); return null; }
+    return data;
+}
+
+// Обновленный экспорт
+module.exports = {
+    getPricesFromDb,
+    savePriceToDb,
+    addManufacturedEntry,
+    getTodaysManufacturedEntries,
+    deleteManufacturedEntry,
+    // Новые функции для расходов
+    addExpenseEntry,
+    getTodaysExpenseEntries,
+    deleteExpenseEntry,
+    // Старые функции
+    getDailyLogEntry,
+    getTodaysLogsGrouped,
+    saveRemainingToDb,
+    processWriteOffInDb,
+    getStatsForPeriod,
+    getProfitabilityAnalysis,
+    getSalesAnalysis,
+    getAverageWeekdayAnalysis,
+    getSalesDataForAI
+};
