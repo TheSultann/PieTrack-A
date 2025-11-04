@@ -299,7 +299,7 @@ npm run test:watch
 
 **Sultanbek Otanazarov**
 
-- GitHub: [[@S7L5An](https://github.com/S7L5An)](https://github.com/TheSultann)
+- GitHub: https://github.com/TheSultann
 - Telegram: [@S7L5An](https://t.me/S7L5An)
 - Email: otanazarovsultanbek@gmail.com
 
